@@ -12,10 +12,14 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
+
+	"io"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -107,6 +111,8 @@ type dirListingMsg struct {
 
 type unmountDoneMsg struct{ err error }
 
+type wipeOutputMsg struct{ line string }
+
 type wipeResultMsg struct{ err error }
 
 type ejectResultMsg struct{ err error }
@@ -152,6 +158,9 @@ type model struct {
 	labelInput     textinput.Model
 	confirmInput   textinput.Model
 	spinner        spinner.Model
+	wipeOutput   []string
+	wipeState    *wipeState
+	wipeViewport viewport.Model
 	wipeErr        error
 
 	// Eject
@@ -159,6 +168,8 @@ type model struct {
 }
 
 // ── Styles ───────────────────────────────────────────────────────────────────
+
+var borderColor = lipgloss.Color("63")
 
 var (
 	titleStyle = lipgloss.NewStyle().
@@ -182,7 +193,59 @@ var (
 	successStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("10")).
 			Bold(true)
+
+	borderFg = lipgloss.NewStyle().Foreground(borderColor)
 )
+
+// renderPane draws a rounded-border box with a title inset into the top border,
+// and a help bar below.
+func (m model) renderPane(title, body, help string) string {
+	innerW := m.width - 4 // 2 for border chars + 2 for padding
+	if innerW < 36 {
+		innerW = 36
+	}
+
+	// Pad the body content
+	padded := lipgloss.NewStyle().Width(innerW).Padding(0, 1).Render(body)
+
+	// Build box
+	border := lipgloss.RoundedBorder()
+	hBar := strings.Repeat(border.Top, innerW+2) // +2 for inner padding
+	titleStr := titleStyle.Render(" " + title + " ")
+	titleW := lipgloss.Width(titleStr)
+
+	// Top border with title spliced in
+	var top string
+	if titleW+2 < len(hBar) {
+		top = borderFg.Render(string(border.TopLeft)) +
+			borderFg.Render(hBar[:1]) +
+			titleStr +
+			borderFg.Render(hBar[1+titleW:]) +
+			borderFg.Render(string(border.TopRight))
+	} else {
+		top = borderFg.Render(string(border.TopLeft)+hBar+string(border.TopRight))
+	}
+
+	// Bottom border
+	bBar := strings.Repeat(border.Bottom, innerW+2)
+	bottom := borderFg.Render(string(border.BottomLeft) + bBar + string(border.BottomRight))
+
+	// Side borders on each line
+	left := borderFg.Render(border.Left)
+	right := borderFg.Render(border.Right)
+	var mid strings.Builder
+	for _, line := range strings.Split(padded, "\n") {
+		// Pad line to full width
+		lineW := lipgloss.Width(line)
+		pad := ""
+		if lineW < innerW+2 {
+			pad = strings.Repeat(" ", innerW+2-lineW)
+		}
+		mid.WriteString(left + line + pad + right + "\n")
+	}
+
+	return top + "\n" + mid.String() + bottom + "\n" + helpStyle.Render(" "+help)
+}
 
 // ── Constructor ──────────────────────────────────────────────────────────────
 
@@ -328,20 +391,15 @@ func (m model) updateDeviceList(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) renderDeviceList() string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("USB Wipe — Device List"))
-	b.WriteString("\n\n")
 	if len(m.devices) == 0 {
-		b.WriteString("  No USB devices found.\n")
+		b.WriteString("No USB devices found.\n")
 	} else {
 		b.WriteString(m.table.View())
-		b.WriteString("\n")
 	}
 	if m.err != "" {
-		b.WriteString(errStyle.Render("  Error: "+m.err) + "\n")
+		b.WriteString("\n" + errStyle.Render("Error: "+m.err))
 	}
-	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("  ↑/↓ navigate • enter select • r refresh • q/esc quit"))
-	return b.String()
+	return m.renderPane("Device List", b.String(), "↑/↓ navigate • enter select • r refresh • q/esc quit")
 }
 
 // ── Device Detail ────────────────────────────────────────────────────────────
@@ -429,15 +487,18 @@ func (m model) updateDeviceDetail(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *model) startBrowse(dev USBDevice, partIdx int) tea.Cmd {
 	var mountPoint string
 	var partPath string
+	var fstype string
 
 	if partIdx >= 0 {
 		p := dev.Partitions[partIdx]
 		mountPoint = p.MountPoint
 		partPath = p.Path
+		fstype = p.FSType
 	} else {
 		// Whole device (superfloppy)
 		mountPoint = dev.MountPoint
 		partPath = dev.Path
+		fstype = dev.FSType
 	}
 
 	if mountPoint != "" {
@@ -457,10 +518,15 @@ func (m *model) startBrowse(dev USBDevice, partIdx int) tea.Cmd {
 		if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 			return mountResultMsg{err: err}
 		}
-		_, err := runCmd("mount", "-o", "ro", partPath, tmpDir)
+		args := []string{"-o", "ro"}
+		if fstype != "" {
+			args = append(args, "-t", fstype)
+		}
+		args = append(args, partPath, tmpDir)
+		out, err := runCmd("mount", args...)
 		if err != nil {
 			os.Remove(tmpDir)
-			return mountResultMsg{err: fmt.Errorf("mount %s: %w", partPath, err)}
+			return mountResultMsg{err: fmt.Errorf("mount %s: %w\n%s", partPath, err, strings.TrimSpace(out))}
 		}
 		return mountResultMsg{path: tmpDir}
 	}
@@ -469,29 +535,25 @@ func (m *model) startBrowse(dev USBDevice, partIdx int) tea.Cmd {
 func (m model) renderDeviceDetail() string {
 	dev := m.devices[m.selectedDev]
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("USB Wipe — Device Detail"))
-	b.WriteString("\n\n")
-	b.WriteString(fmt.Sprintf("  Device:  %s\n", dev.Path))
-	b.WriteString(fmt.Sprintf("  Model:   %s %s\n", dev.Vendor, dev.Model))
-	b.WriteString(fmt.Sprintf("  Size:    %s\n", dev.SizeHuman))
+	b.WriteString(fmt.Sprintf("Device:  %s\n", dev.Path))
+	b.WriteString(fmt.Sprintf("Model:   %s %s\n", dev.Vendor, dev.Model))
+	b.WriteString(fmt.Sprintf("Size:    %s\n", dev.SizeHuman))
 
 	if len(dev.Partitions) > 0 || dev.FSType != "" {
 		b.WriteString("\n")
 		b.WriteString(m.partTable.View())
 	} else {
-		b.WriteString("\n  No partitions or filesystem detected.\n")
+		b.WriteString("\nNo partitions or filesystem detected.\n")
 	}
 
 	if m.err != "" {
-		b.WriteString("\n" + errStyle.Render("  Error: "+m.err))
+		b.WriteString("\n" + errStyle.Render("Error: "+m.err))
 	}
-	b.WriteString("\n\n")
-	help := "  esc back • w wipe"
+	help := "esc back • w wipe"
 	if len(dev.Partitions) > 0 || dev.FSType != "" {
 		help += " • ↑/↓ navigate • enter browse"
 	}
-	b.WriteString(helpStyle.Render(help))
-	return b.String()
+	return m.renderPane("Device Detail", b.String(), help)
 }
 
 // ── File Browser ─────────────────────────────────────────────────────────────
@@ -609,16 +671,13 @@ func parseDirEntries(entries []fs.DirEntry) []fileEntry {
 
 func (m model) renderFileBrowser() string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("USB Wipe — File Browser"))
-	b.WriteString("\n")
-	b.WriteString(dimStyle.Render("  " + m.browseDir))
+	b.WriteString(dimStyle.Render(m.browseDir))
 	b.WriteString("\n\n")
 
 	if len(m.browseEntries) == 0 {
-		b.WriteString("  (empty directory)\n")
+		b.WriteString("(empty directory)\n")
 	} else {
-		// Determine visible window
-		visibleLines := m.height - 8
+		visibleLines := m.height - 10
 		if visibleLines < 5 {
 			visibleLines = 5
 		}
@@ -657,11 +716,9 @@ func (m model) renderFileBrowser() string {
 	}
 
 	if m.err != "" {
-		b.WriteString("\n" + errStyle.Render("  Error: "+m.err))
+		b.WriteString("\n" + errStyle.Render("Error: "+m.err))
 	}
-	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("  ↑/↓ navigate • enter open dir • backspace parent • esc exit"))
-	return b.String()
+	return m.renderPane("File Browser", b.String(), "↑/↓ navigate • enter open dir • backspace parent • esc exit")
 }
 
 // ── Wipe Mode ────────────────────────────────────────────────────────────────
@@ -698,9 +755,7 @@ func (m model) updateWipeMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) renderWipeMode() string {
 	dev := m.devices[m.selectedDev]
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("USB Wipe — Wipe Mode"))
-	b.WriteString("\n\n")
-	b.WriteString(fmt.Sprintf("  Device: %s (%s %s, %s)\n\n", dev.Path, dev.Vendor, dev.Model, dev.SizeHuman))
+	b.WriteString(fmt.Sprintf("Device: %s (%s %s, %s)\n\n", dev.Path, dev.Vendor, dev.Model, dev.SizeHuman))
 	for i, label := range wipeModeLabels {
 		cursor := "  "
 		if i == m.wipeModeCursor {
@@ -717,9 +772,7 @@ func (m model) renderWipeMode() string {
 		b.WriteString(line + "\n")
 		b.WriteString(desc + "\n")
 	}
-	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("  ↑/↓ navigate • enter select • esc cancel"))
-	return b.String()
+	return m.renderPane("Wipe Mode", b.String(), "↑/↓ navigate • enter select • esc cancel")
 }
 
 // ── Wipe Filesystem ──────────────────────────────────────────────────────────
@@ -757,10 +810,8 @@ func (m model) updateWipeFS(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) renderWipeFS() string {
 	dev := m.devices[m.selectedDev]
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("USB Wipe — Filesystem"))
-	b.WriteString("\n\n")
-	b.WriteString(fmt.Sprintf("  Device: %s (%s %s, %s)\n", dev.Path, dev.Vendor, dev.Model, dev.SizeHuman))
-	b.WriteString(fmt.Sprintf("  Mode:   %s\n\n", wipeModeLabels[m.wipeMode]))
+	b.WriteString(fmt.Sprintf("Device: %s (%s %s, %s)\n", dev.Path, dev.Vendor, dev.Model, dev.SizeHuman))
+	b.WriteString(fmt.Sprintf("Mode:   %s\n\n", wipeModeLabels[m.wipeMode]))
 	for i, label := range fsTypeLabels {
 		cursor := "  "
 		if i == m.fsCursor {
@@ -777,9 +828,7 @@ func (m model) renderWipeFS() string {
 		b.WriteString(line + "\n")
 		b.WriteString(desc + "\n")
 	}
-	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("  ↑/↓ navigate • enter select • esc back"))
-	return b.String()
+	return m.renderPane("Filesystem", b.String(), "↑/↓ navigate • enter select • esc back")
 }
 
 // ── Wipe Label ───────────────────────────────────────────────────────────────
@@ -820,21 +869,17 @@ func (m model) updateWipeLabel(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) renderWipeLabel() string {
-	var b strings.Builder
 	dev := m.devices[m.selectedDev]
-	b.WriteString(titleStyle.Render("USB Wipe — Volume Label"))
-	b.WriteString("\n\n")
-	b.WriteString(fmt.Sprintf("  Device: %s (%s %s, %s)\n", dev.Path, dev.Vendor, dev.Model, dev.SizeHuman))
-	b.WriteString(fmt.Sprintf("  Mode:   %s\n", wipeModeLabels[m.wipeMode]))
-	b.WriteString(fmt.Sprintf("  FS:     %s\n\n", fsTypeLabels[m.fsType]))
-	b.WriteString(fmt.Sprintf("  Volume label (max %d chars):\n\n", m.labelMaxLen()))
-	b.WriteString("  " + m.labelInput.View())
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Device: %s (%s %s, %s)\n", dev.Path, dev.Vendor, dev.Model, dev.SizeHuman))
+	b.WriteString(fmt.Sprintf("Mode:   %s\n", wipeModeLabels[m.wipeMode]))
+	b.WriteString(fmt.Sprintf("FS:     %s\n\n", fsTypeLabels[m.fsType]))
+	b.WriteString(fmt.Sprintf("Volume label (max %d chars):\n\n", m.labelMaxLen()))
+	b.WriteString(m.labelInput.View())
 	if m.err != "" {
-		b.WriteString("\n\n" + errStyle.Render("  "+m.err))
+		b.WriteString("\n\n" + errStyle.Render(m.err))
 	}
-	b.WriteString("\n\n")
-	b.WriteString(helpStyle.Render("  enter continue • esc back"))
-	return b.String()
+	return m.renderPane("Volume Label", b.String(), "enter continue • esc back")
 }
 
 // ── Wipe Confirm ─────────────────────────────────────────────────────────────
@@ -855,9 +900,13 @@ func (m model) updateWipeConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.err = ""
 			m.view = viewWiping
+			m.wipeOutput = nil
+			m.wipeErr = nil
 			dev := m.devices[m.selectedDev]
 			label := strings.ToUpper(m.labelInput.Value())
-			return m, tea.Batch(m.spinner.Tick, wipeCmd(dev, label, m.wipeMode, m.fsType))
+			m.wipeState = startWipe(dev, label, m.wipeMode, m.fsType)
+			m.wipeViewport = viewport.New(m.width, m.height-6)
+			return m, tea.Batch(m.spinner.Tick, waitForWipeOutput(m.wipeState))
 		}
 	}
 	var cmd tea.Cmd
@@ -866,29 +915,41 @@ func (m model) updateWipeConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) renderWipeConfirm() string {
-	var b strings.Builder
 	dev := m.devices[m.selectedDev]
-	b.WriteString(titleStyle.Render("USB Wipe — Confirm"))
+	var b strings.Builder
+	b.WriteString(errStyle.Render(fmt.Sprintf("⚠ WIPE ALL DATA on %s (%s %s, %s)?", dev.Path, dev.Vendor, dev.Model, dev.SizeHuman)))
 	b.WriteString("\n\n")
-	b.WriteString(errStyle.Render(fmt.Sprintf("  ⚠ WIPE ALL DATA on %s (%s %s, %s)?", dev.Path, dev.Vendor, dev.Model, dev.SizeHuman)))
-	b.WriteString("\n\n")
-	b.WriteString(fmt.Sprintf("  Mode:  %s\n", wipeModeLabels[m.wipeMode]))
-	b.WriteString(fmt.Sprintf("  FS:    %s\n", fsTypeLabels[m.fsType]))
-	b.WriteString(fmt.Sprintf("  Label: %s\n\n", strings.ToUpper(m.labelInput.Value())))
-	b.WriteString("  Type 'yes' to confirm:\n\n")
-	b.WriteString("  " + m.confirmInput.View())
+	b.WriteString(fmt.Sprintf("Mode:  %s\n", wipeModeLabels[m.wipeMode]))
+	b.WriteString(fmt.Sprintf("FS:    %s\n", fsTypeLabels[m.fsType]))
+	b.WriteString(fmt.Sprintf("Label: %s\n\n", strings.ToUpper(m.labelInput.Value())))
+	b.WriteString("Type 'yes' to confirm:\n\n")
+	b.WriteString(m.confirmInput.View())
 	if m.err != "" {
-		b.WriteString("\n\n" + errStyle.Render("  "+m.err))
+		b.WriteString("\n\n" + errStyle.Render(m.err))
 	}
-	b.WriteString("\n\n")
-	b.WriteString(helpStyle.Render("  enter confirm • esc back"))
-	return b.String()
+	return m.renderPane("Confirm", b.String(), "enter confirm • esc back")
 }
 
 // ── Wiping ───────────────────────────────────────────────────────────────────
 
 func (m model) updateWiping(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case wipeOutputMsg:
+		line := msg.line
+		// Lines prefixed with \r overwrite the last output line (progress counters)
+		if strings.HasPrefix(line, "\r") {
+			line = line[1:]
+			if len(m.wipeOutput) > 0 {
+				m.wipeOutput[len(m.wipeOutput)-1] = line
+			} else {
+				m.wipeOutput = append(m.wipeOutput, line)
+			}
+		} else {
+			m.wipeOutput = append(m.wipeOutput, line)
+		}
+		m.wipeViewport.SetContent(strings.Join(m.wipeOutput, "\n"))
+		m.wipeViewport.GotoBottom()
+		return m, waitForWipeOutput(m.wipeState)
 	case wipeResultMsg:
 		m.wipeErr = msg.err
 		m.view = viewWipeDone
@@ -897,26 +958,29 @@ func (m model) updateWiping(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.wipeViewport.Width = msg.Width
+		m.wipeViewport.Height = msg.Height - 6
+		return m, nil
 	}
 	return m, nil
 }
 
 func (m model) renderWiping() string {
-	var b strings.Builder
 	dev := m.devices[m.selectedDev]
-	b.WriteString(titleStyle.Render("USB Wipe — Wiping"))
-	b.WriteString("\n\n")
 	step := "Wiping"
 	switch m.wipeMode {
 	case wipeQuickVerify:
 		step = "Wiping (quick verify)"
 	case wipeFullVerify:
-		step = "Wiping (full verify — this may take a while)"
+		step = "Wiping (full verify)"
 	}
-	b.WriteString(fmt.Sprintf("  %s %s %s...", m.spinner.View(), step, dev.Path))
-	b.WriteString("\n\n")
-	b.WriteString(helpStyle.Render("  Please wait..."))
-	return b.String()
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("%s %s %s...\n\n", m.spinner.View(), step, dev.Path))
+	b.WriteString(m.wipeViewport.View())
+	return m.renderPane("Wiping", b.String(), "Please wait...")
 }
 
 // ── Wipe Done ────────────────────────────────────────────────────────────────
@@ -963,25 +1027,22 @@ func (m model) updateWipeDone(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) renderWipeDone() string {
-	var b strings.Builder
 	dev := m.devices[m.selectedDev]
-	b.WriteString(titleStyle.Render("USB Wipe — Complete"))
-	b.WriteString("\n\n")
+	var b strings.Builder
+	var help string
 	if m.wipeErr != nil {
-		b.WriteString(errStyle.Render(fmt.Sprintf("  Wipe FAILED: %v", m.wipeErr)))
-		b.WriteString("\n\n")
-		b.WriteString(helpStyle.Render("  esc back to list • q quit"))
+		b.WriteString(errStyle.Render(fmt.Sprintf("Wipe FAILED: %v", m.wipeErr)))
+		help = "esc back to list • q quit"
 	} else {
-		b.WriteString(successStyle.Render(fmt.Sprintf("  ✓ Successfully wiped %s", dev.Path)))
+		b.WriteString(successStyle.Render(fmt.Sprintf("✓ Successfully wiped %s", dev.Path)))
 		b.WriteString("\n")
-		b.WriteString(fmt.Sprintf("  Label: %s\n", strings.ToUpper(m.labelInput.Value())))
+		b.WriteString(fmt.Sprintf("Label: %s\n", strings.ToUpper(m.labelInput.Value())))
 		if m.ejectErr != nil {
-			b.WriteString("\n" + errStyle.Render(fmt.Sprintf("  Eject failed: %v", m.ejectErr)))
+			b.WriteString("\n" + errStyle.Render(fmt.Sprintf("Eject failed: %v", m.ejectErr)))
 		}
-		b.WriteString("\n")
-		b.WriteString(helpStyle.Render("  e eject & quit • enter/q quit • esc back to list"))
+		help = "e eject & quit • enter/q quit • esc back to list"
 	}
-	return b.String()
+	return m.renderPane("Complete", b.String(), help)
 }
 
 // ── View ─────────────────────────────────────────────────────────────────────
@@ -1024,10 +1085,27 @@ func readDirCmd(path string) tea.Cmd {
 	}
 }
 
-func wipeCmd(dev USBDevice, label string, mode wipeMode, fs fsType) tea.Cmd {
+type wipeState struct {
+	ch  chan wipeOutputMsg
+	err error
+}
+
+func startWipe(dev USBDevice, label string, mode wipeMode, fs fsType) *wipeState {
+	ws := &wipeState{ch: make(chan wipeOutputMsg, 64)}
+	go func() {
+		ws.err = doWipe(dev, label, mode, fs, ws.ch)
+		close(ws.ch)
+	}()
+	return ws
+}
+
+func waitForWipeOutput(ws *wipeState) tea.Cmd {
 	return func() tea.Msg {
-		err := doWipe(dev, label, mode, fs)
-		return wipeResultMsg{err: err}
+		msg, ok := <-ws.ch
+		if !ok {
+			return wipeResultMsg{err: ws.err}
+		}
+		return msg
 	}
 }
 
@@ -1239,34 +1317,43 @@ func checkMountSafety(dev USBDevice) error {
 	return nil
 }
 
-func doWipe(dev USBDevice, label string, mode wipeMode, fstype fsType) error {
+func doWipe(dev USBDevice, label string, mode wipeMode, fstype fsType, ch chan<- wipeOutputMsg) error {
+	emit := func(format string, args ...any) {
+		ch <- wipeOutputMsg{line: fmt.Sprintf(format, args...)}
+	}
+
 	// Unmount everything
 	if dev.MountPoint != "" {
-		if out, err := runCmd("umount", dev.Path); err != nil {
-			return fmt.Errorf("umount %s: %w\n%s", dev.Path, err, out)
+		emit("Unmounting %s...", dev.Path)
+		if err := runCmdStream("umount", ch, dev.Path); err != nil {
+			return fmt.Errorf("umount %s: %w", dev.Path, err)
 		}
 	}
 	for _, p := range dev.Partitions {
 		if p.MountPoint != "" {
-			if out, err := runCmd("umount", p.Path); err != nil {
-				return fmt.Errorf("umount %s: %w\n%s", p.Path, err, out)
+			emit("Unmounting %s...", p.Path)
+			if err := runCmdStream("umount", ch, p.Path); err != nil {
+				return fmt.Errorf("umount %s: %w", p.Path, err)
 			}
 		}
 	}
 
 	// Full verify: run badblocks destructive write test on whole device
 	if mode == wipeFullVerify {
-		if out, err := runCmd("badblocks", "-w", "-s", dev.Path); err != nil {
-			return fmt.Errorf("badblocks: %w\n%s", err, out)
+		emit("Running full surface scan (badblocks -w)...")
+		if err := runCmdStream("badblocks", ch, "-w", "-s", dev.Path); err != nil {
+			return fmt.Errorf("badblocks: %w", err)
 		}
 	}
 
 	// Wipe filesystem signatures
-	if out, err := runCmd("wipefs", "-a", dev.Path); err != nil {
-		return fmt.Errorf("wipefs: %w\n%s", err, out)
+	emit("Wiping filesystem signatures...")
+	if err := runCmdStream("wipefs", ch, "-a", dev.Path); err != nil {
+		return fmt.Errorf("wipefs: %w", err)
 	}
 
 	// Partition table
+	emit("Creating partition table...")
 	var sfdiskInput string
 	switch fstype {
 	case fsExFAT:
@@ -1274,38 +1361,118 @@ func doWipe(dev USBDevice, label string, mode wipeMode, fstype fsType) error {
 	default:
 		sfdiskInput = "label: dos\ntype=c\n" // type c = FAT32 LBA
 	}
-	if out, err := runCmdStdin("sfdisk", sfdiskInput, "--lock", dev.Path); err != nil {
-		return fmt.Errorf("sfdisk: %w\n%s", err, out)
+	if err := runCmdStdinStream("sfdisk", sfdiskInput, ch, "--lock", dev.Path); err != nil {
+		return fmt.Errorf("sfdisk: %w", err)
 	}
 
-	// Format
+	// Wait for kernel to pick up new partition table
 	part1 := dev.Path + "1"
+	emit("Waiting for %s to appear...", part1)
+	runCmdStream("partprobe", ch, dev.Path)
+	runCmdStream("udevadm", ch, "settle", "--timeout=5")
+	// Verify the partition device exists
+	for i := 0; i < 20; i++ {
+		if _, err := os.Stat(part1); err == nil {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if _, err := os.Stat(part1); err != nil {
+		return fmt.Errorf("partition %s did not appear after sfdisk", part1)
+	}
 	switch fstype {
 	case fsExFAT:
-		args := []string{"-n", label, part1}
 		if mode == wipeQuickVerify {
-			// mkfs.exfat doesn't support -c; use badblocks read-only check instead
-			if out, err := runCmd("badblocks", "-s", part1); err != nil {
-				return fmt.Errorf("badblocks (quick check): %w\n%s", err, out)
+			emit("Running quick verify (badblocks)...")
+			if err := runCmdStream("badblocks", ch, "-s", part1); err != nil {
+				return fmt.Errorf("badblocks (quick check): %w", err)
 			}
 		}
-		if out, err := runCmd("mkfs.exfat", args...); err != nil {
-			return fmt.Errorf("mkfs.exfat: %w\n%s", err, out)
+		emit("Formatting %s as exFAT (label: %s)...", part1, label)
+		if err := runCmdStream("mkfs.exfat", ch, "-n", label, part1); err != nil {
+			return fmt.Errorf("mkfs.exfat: %w", err)
 		}
 	default:
 		args := []string{"-F", "32", "-n", label}
 		if mode == wipeQuickVerify {
+			emit("Formatting %s as FAT32 with bad block check (label: %s)...", part1, label)
 			args = append(args, "-c")
+		} else {
+			emit("Formatting %s as FAT32 (label: %s)...", part1, label)
 		}
 		args = append(args, part1)
-		if out, err := runCmd("mkfs.vfat", args...); err != nil {
-			return fmt.Errorf("mkfs.vfat: %w\n%s", err, out)
+		if err := runCmdStream("mkfs.vfat", ch, args...); err != nil {
+			return fmt.Errorf("mkfs.vfat: %w", err)
 		}
 	}
 
+	emit("Done.")
 	return nil
 }
 
+func runCmdStream(name string, ch chan<- wipeOutputMsg, args ...string) error {
+	return runCmdStdinStream(name, "", ch, args...)
+}
+
+func runCmdStdinStream(name string, stdin string, ch chan<- wipeOutputMsg, args ...string) error {
+	cmd := exec.Command(name, args...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+
+	// Merge stdout and stderr into one pipe
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	// Read output, splitting on both \n and \r for progress counters
+	go func() {
+		defer pr.Close()
+		buf := make([]byte, 4096)
+		var partial string
+		for {
+			n, err := pr.Read(buf)
+			if n > 0 {
+				partial += string(buf[:n])
+				// Split on newlines and carriage returns
+				for {
+					idx := strings.IndexAny(partial, "\n\r")
+					if idx < 0 {
+						break
+					}
+					line := partial[:idx]
+					sep := partial[idx]
+					partial = partial[idx+1:]
+					if line == "" && sep == '\n' {
+						continue
+					}
+					if sep == '\r' {
+						// Send with \r prefix so the TUI knows to overwrite
+						ch <- wipeOutputMsg{line: "\r" + line}
+					} else {
+						ch <- wipeOutputMsg{line: line}
+					}
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		if partial != "" {
+			ch <- wipeOutputMsg{line: partial}
+		}
+	}()
+
+	err := cmd.Wait()
+	pw.Close()
+	return err
+}
+
+// runCmd and runCmdStdin kept for non-wipe use (detection, mount, eject)
 func runCmd(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 	out, err := cmd.CombinedOutput()
