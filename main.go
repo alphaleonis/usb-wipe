@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
+	"log/syslog"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -73,7 +75,7 @@ var wipeModeLabels = []string{
 
 var wipeModeDescs = []string{
 	"Reformat only (fastest)",
-	"Reformat with bad sector check (FAT32 only)",
+	"Reformat with bad sector check",
 	"Full surface scan with badblocks, then reformat (slow)",
 }
 
@@ -216,24 +218,24 @@ func (m model) renderPane(title, body, help string) string {
 
 	// Build box
 	border := lipgloss.RoundedBorder()
-	hBar := strings.Repeat(border.Top, innerW+2) // +2 for inner padding
+	hBar := []rune(strings.Repeat(border.Top, innerW+2)) // +2 for inner padding
 	titleStr := titleStyle.Render(" " + title + " ")
 	titleW := lipgloss.Width(titleStr)
 
-	// Top border with title spliced in
+	// Top border with title spliced in (use rune slicing — border chars are multi-byte UTF-8)
 	var top string
 	if titleW+2 < len(hBar) {
 		top = borderFg.Render(string(border.TopLeft)) +
-			borderFg.Render(hBar[:1]) +
+			borderFg.Render(string(hBar[:1])) +
 			titleStr +
-			borderFg.Render(hBar[1+titleW:]) +
+			borderFg.Render(string(hBar[1+titleW:])) +
 			borderFg.Render(string(border.TopRight))
 	} else {
-		top = borderFg.Render(string(border.TopLeft)+hBar+string(border.TopRight))
+		top = borderFg.Render(string(border.TopLeft) + string(hBar) + string(border.TopRight))
 	}
 
 	// Bottom border
-	bBar := strings.Repeat(border.Bottom, innerW+2)
+	bBar := string([]rune(strings.Repeat(border.Bottom, innerW+2)))
 	bottom := borderFg.Render(string(border.BottomLeft) + bBar + string(border.BottomRight))
 
 	// Side borders on each line
@@ -329,10 +331,13 @@ func (m model) Init() tea.Cmd {
 // ── Update ───────────────────────────────────────────────────────────────────
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
+	if msg, ok := msg.(tea.WindowSizeMsg); ok {
 		m.width = msg.Width
 		m.height = msg.Height
+		if m.view == viewWiping {
+			m.wipeViewport.Width = msg.Width
+			m.wipeViewport.Height = msg.Height - 6
+		}
 		return m, nil
 	}
 
@@ -514,14 +519,13 @@ func (m *model) startBrowse(dev USBDevice, partIdx int) tea.Cmd {
 		return readDirCmd(mountPoint)
 	}
 
-	// Need to mount it
-	partName := filepath.Base(partPath)
-	tmpDir := "/tmp/usbwipe-" + partName
-	m.browseMntPath = tmpDir
-	m.browseDir = tmpDir
+	// Need to mount it — use unpredictable temp dir to prevent symlink attacks
+	m.browseMntPath = "" // set after successful MkdirTemp
+	m.browseDir = ""
 
 	return func() tea.Msg {
-		if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		tmpDir, err := os.MkdirTemp("", "usbwipe-")
+		if err != nil {
 			return mountResultMsg{err: err}
 		}
 		args := []string{"-o", "ro"}
@@ -572,6 +576,16 @@ func (m model) updateFileBrowser(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.view = viewDeviceDetail
 			return m, nil
 		}
+		// If user navigated away while mount was in progress, clean up
+		if m.view != viewFileBrowser {
+			go func() {
+				runCmd("umount", msg.path)
+				os.Remove(msg.path)
+			}()
+			return m, nil
+		}
+		m.browseMntPath = msg.path
+		m.browseDir = msg.path
 		return m, readDirCmd(msg.path)
 
 	case dirListingMsg:
@@ -586,6 +600,9 @@ func (m model) updateFileBrowser(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case unmountDoneMsg:
+		if msg.err != nil {
+			m.err = fmt.Sprintf("unmount warning: %v", msg.err)
+		}
 		m.view = viewDeviceDetail
 		return m, nil
 
@@ -645,9 +662,9 @@ func (m *model) cleanupBrowse() tea.Cmd {
 	mnt := m.browseMntPath
 	m.browseMntPath = ""
 	return func() tea.Msg {
-		runCmd("umount", mnt)
+		_, err := runCmd("umount", mnt)
 		os.Remove(mnt)
-		return unmountDoneMsg{}
+		return unmountDoneMsg{err: err}
 	}
 }
 
@@ -841,9 +858,9 @@ func (m model) renderWipeFS() string {
 
 func (m model) labelMaxLen() int {
 	if m.fsType == fsExFAT {
-		return 15
+		return 15 // exFAT spec: max 15 characters (spec measures UTF-16 code units; BMP-only in practice)
 	}
-	return 11
+	return 11 // FAT32 spec: 11-byte volume label field in directory entry
 }
 
 func (m model) updateWipeLabel(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -858,9 +875,29 @@ func (m model) updateWipeLabel(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			val := m.labelInput.Value()
 			maxLen := m.labelMaxLen()
-			if val == "" || len(val) > maxLen {
+			if val == "" || utf8.RuneCountInString(val) > maxLen {
 				m.err = fmt.Sprintf("Label must be 1-%d characters", maxLen)
 				return m, nil
+			}
+			// Validate label characters (reject control chars and invalid FS characters)
+			upper := strings.ToUpper(val)
+			if m.fsType == fsFAT32 {
+				// Intentionally more restrictive than the FAT32 spec (which allows
+				// chars like !#$&). Conservative allowlist avoids shell-quoting
+				// surprises and cross-platform compatibility issues.
+				for _, r := range upper {
+					if !((r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == ' ' || r == '_' || r == '-') {
+						m.err = "FAT32 label: A-Z, 0-9, space, underscore, hyphen only"
+						return m, nil
+					}
+				}
+			} else {
+				for _, r := range val {
+					if r < 0x20 || r == 0x7F {
+						m.err = "Label must not contain control characters"
+						return m, nil
+					}
+				}
 			}
 			m.err = ""
 			m.confirmInput.SetValue("")
@@ -987,16 +1024,13 @@ func (m model) updateWiping(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
-	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		m.wipeViewport.Width = msg.Width
-		m.wipeViewport.Height = msg.Height - 6
-		return m, nil
 	}
 	return m, nil
 }
 
+// renderWipeOutput styles wipe log lines. Lines prefixed with \x00 are
+// command echoes (injected by runCmdStdinStream) and rendered with cmdStyle;
+// the prefix is stripped before display.
 func renderWipeOutput(lines []string) string {
 	styled := make([]string, len(lines))
 	for i, line := range lines {
@@ -1226,6 +1260,8 @@ func detectUSBDevices() ([]USBDevice, error) {
 			continue
 		}
 
+		// /sys/block/*/size is always in 512-byte units per Linux kernel ABI,
+		// regardless of the device's physical sector size.
 		sizeBytes := sizeSectors * 512
 		sizeHuman := humanSize(sizeBytes)
 
@@ -1250,8 +1286,8 @@ func detectUSBDevices() ([]USBDevice, error) {
 				Name: pName,
 				Path: pPath,
 			}
-			if mp, ok := mounts[pPath]; ok {
-				part.MountPoint = mp
+			if mps, ok := mounts[pPath]; ok && len(mps) > 0 {
+				part.MountPoint = mps[0]
 			}
 			if info, ok := blkidInfo[pPath]; ok {
 				part.FSType = info.fsType
@@ -1264,8 +1300,8 @@ func detectUSBDevices() ([]USBDevice, error) {
 			dev.FSType = info.fsType
 			dev.Label = info.label
 		}
-		if mp, ok := mounts[dev.Path]; ok {
-			dev.MountPoint = mp
+		if mps, ok := mounts[dev.Path]; ok && len(mps) > 0 {
+			dev.MountPoint = mps[0]
 		}
 
 		devices = append(devices, dev)
@@ -1301,8 +1337,8 @@ func humanSize(b int64) string {
 	}
 }
 
-func parseProcMounts() map[string]string {
-	mounts := make(map[string]string)
+func parseProcMounts() map[string][]string {
+	mounts := make(map[string][]string)
 	f, err := os.Open("/proc/mounts")
 	if err != nil {
 		return mounts
@@ -1313,7 +1349,7 @@ func parseProcMounts() map[string]string {
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) >= 2 {
-			mounts[fields[0]] = fields[1]
+			mounts[fields[0]] = append(mounts[fields[0]], fields[1])
 		}
 	}
 	return mounts
@@ -1361,36 +1397,84 @@ func parseBlkid() map[string]blkidEntry {
 }
 
 func checkMountSafety(dev USBDevice) error {
-	critical := map[string]bool{"/": true, "/boot": true, "/home": true}
-	if critical[dev.MountPoint] {
-		return fmt.Errorf("refusing to wipe: %s is mounted at %s", dev.Path, dev.MountPoint)
+	critical := map[string]bool{
+		"/": true, "/boot": true, "/home": true,
+		"/usr": true, "/var": true, "/etc": true,
+		"/srv": true, "/opt": true, "/tmp": true,
 	}
+	// Re-read current mounts to catch changes since detection
+	mounts := parseProcMounts()
+	paths := []string{dev.Path}
 	for _, p := range dev.Partitions {
-		if critical[p.MountPoint] {
-			return fmt.Errorf("refusing to wipe: %s is mounted at %s", p.Path, p.MountPoint)
+		paths = append(paths, p.Path)
+	}
+	for _, devPath := range paths {
+		for _, mp := range mounts[devPath] {
+			for critPath := range critical {
+				if mp == critPath || strings.HasPrefix(mp, critPath+"/") {
+					return fmt.Errorf("refusing to wipe: %s is mounted at %s", devPath, mp)
+				}
+			}
 		}
 	}
 	return nil
 }
 
-func doWipe(dev USBDevice, label string, mode wipeMode, fstype fsType, ws *wipeState) error {
+func doWipe(dev USBDevice, label string, mode wipeMode, fstype fsType, ws *wipeState) (retErr error) {
 	ch := ws.ch
 	emit := func(format string, args ...any) {
 		ch <- wipeOutputMsg{line: fmt.Sprintf(format, args...)}
 	}
 
-	// Unmount everything
-	if dev.MountPoint != "" {
-		emit("Unmounting %s...", dev.Path)
-		if err := runCmdStream("umount", ws, dev.Path); err != nil {
-			return fmt.Errorf("umount %s: %w", dev.Path, err)
-		}
+	// Re-verify device identity to guard against TOCTOU (device unplugged/replugged
+	// with a different device receiving the same /dev/sdX path)
+	base := "/sys/block/" + dev.Name
+	curModel := strings.TrimSpace(readSysfs(base + "/device/model"))
+	curVendor := strings.TrimSpace(readSysfs(base + "/device/vendor"))
+	var curSectors int64
+	fmt.Sscanf(readSysfs(base+"/size"), "%d", &curSectors)
+	if curModel != dev.Model || curVendor != dev.Vendor || curSectors != dev.SizeSectors {
+		return fmt.Errorf("device %s identity changed since selection (expected %s %s, got %s %s) — was it unplugged?",
+			dev.Path, dev.Vendor, dev.Model, curVendor, curModel)
 	}
+
+	// Re-check mount safety (mounts may have changed since the user pressed 'w')
+	if err := checkMountSafety(dev); err != nil {
+		return err
+	}
+
+	// Audit log — persistent record of destructive operations (best-effort;
+	// if syslog is unavailable the wipe proceeds with a warning).
+	if sl, err := syslog.New(syslog.LOG_NOTICE|syslog.LOG_USER, "usbwipe"); err == nil {
+		sl.Notice(fmt.Sprintf("WIPE START device=%s vendor=%q model=%q size=%s mode=%s fs=%s label=%q",
+			dev.Path, dev.Vendor, dev.Model, dev.SizeHuman, wipeModeLabels[mode], fsTypeLabels[fstype], label))
+		defer func() {
+			if retErr != nil {
+				sl.Err(fmt.Sprintf("WIPE FAILED device=%s err=%v", dev.Path, retErr))
+			} else {
+				sl.Notice(fmt.Sprintf("WIPE OK device=%s", dev.Path))
+			}
+			sl.Close()
+		}()
+	} else {
+		emit("warning: audit log unavailable (syslog): %v", err)
+	}
+
+	// Unmount everything — re-read /proc/mounts for current state
+	// (mounts may have changed since detection, e.g. auto-mount)
+	mounts := parseProcMounts()
+	devPaths := []string{dev.Path}
 	for _, p := range dev.Partitions {
-		if p.MountPoint != "" {
-			emit("Unmounting %s...", p.Path)
-			if err := runCmdStream("umount", ws, p.Path); err != nil {
-				return fmt.Errorf("umount %s: %w", p.Path, err)
+		devPaths = append(devPaths, p.Path)
+	}
+	for _, dp := range devPaths {
+		for _, mp := range mounts[dp] {
+			emit("Unmounting %s (%s)...", dp, mp)
+			if err := runCmdStream("umount", ws, mp); err != nil {
+				// Re-check — mount may have been removed by a prior umount (bind mounts)
+				if fresh := parseProcMounts(); len(fresh[dp]) > 0 {
+					return fmt.Errorf("umount %s: %w", mp, err)
+				}
 			}
 		}
 	}
@@ -1427,7 +1511,9 @@ func doWipe(dev USBDevice, label string, mode wipeMode, fstype fsType, ws *wipeS
 	emit("Waiting for %s to appear...", part1)
 	runCmdStream("partprobe", ws, dev.Path)
 	runCmdStream("udevadm", ws, "settle", "--timeout=5")
-	// Verify the partition device exists
+	// udevadm settle can return before the device node is actually created
+	// (race between udev rule execution and devtmpfs node creation).
+	// Poll as a fallback for slow USB controllers / hubs.
 	for i := 0; i < 20; i++ {
 		if _, err := os.Stat(part1); err == nil {
 			break
@@ -1437,6 +1523,15 @@ func doWipe(dev USBDevice, label string, mode wipeMode, fstype fsType, ws *wipeS
 	if _, err := os.Stat(part1); err != nil {
 		return fmt.Errorf("partition %s did not appear after sfdisk", part1)
 	}
+	// Quick verify for exFAT: run badblocks read-only scan
+	// (mkfs.exfat has no built-in -c flag unlike mkfs.vfat)
+	if mode == wipeQuickVerify && fstype == fsExFAT {
+		emit("Running quick bad block check on %s...", part1)
+		if err := runCmdStream("badblocks", ws, "-s", "-v", part1); err != nil {
+			return fmt.Errorf("badblocks: %w", err)
+		}
+	}
+
 	switch fstype {
 	case fsExFAT:
 		emit("Formatting %s as exFAT (label: %s)...", part1, label)
@@ -1498,13 +1593,23 @@ func openPTY() (master, slave *os.File, err error) {
 	// Set raw mode: disable echo, canonical mode, signal generation,
 	// and output processing (ONLCR converts \n→\r\n which we don't want).
 	var attr syscall.Termios
-	syscall.Syscall(syscall.SYS_IOCTL, slave.Fd(),
-		syscall.TCGETS, uintptr(unsafe.Pointer(&attr)))
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, slave.Fd(),
+		syscall.TCGETS, uintptr(unsafe.Pointer(&attr))); errno != 0 {
+		master.Close()
+		slave.Close()
+		err = fmt.Errorf("TCGETS: %v", errno)
+		return
+	}
 	attr.Iflag &^= syscall.ICRNL | syscall.INLCR | syscall.IGNCR | syscall.IXON
 	attr.Oflag &^= syscall.OPOST
 	attr.Lflag &^= syscall.ECHO | syscall.ECHONL | syscall.ICANON | syscall.ISIG | syscall.IEXTEN
-	syscall.Syscall(syscall.SYS_IOCTL, slave.Fd(),
-		syscall.TCSETS, uintptr(unsafe.Pointer(&attr)))
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, slave.Fd(),
+		syscall.TCSETS, uintptr(unsafe.Pointer(&attr))); errno != 0 {
+		master.Close()
+		slave.Close()
+		err = fmt.Errorf("TCSETS: %v", errno)
+		return
+	}
 
 	return
 }
@@ -1548,7 +1653,10 @@ func runCmdStdinStream(name string, stdin string, ws *wipeState, args ...string)
 
 	// Process output byte-by-byte, handling \n, \r, and \b (backspace).
 	// badblocks uses \b to overwrite progress in-place rather than \r.
+	var readerWg sync.WaitGroup
+	readerWg.Add(1)
 	go func() {
+		defer readerWg.Done()
 		defer master.Close()
 		buf := make([]byte, 4096)
 		var curLine []byte     // current line buffer (content persists across \b)
@@ -1610,6 +1718,7 @@ func runCmdStdinStream(name string, stdin string, ws *wipeState, args ...string)
 	}()
 
 	err = cmd.Wait()
+	readerWg.Wait() // ensure all PTY output is drained before returning
 
 	ws.mu.Lock()
 	ws.cmd = nil
@@ -1617,21 +1726,39 @@ func runCmdStdinStream(name string, stdin string, ws *wipeState, args ...string)
 	return err
 }
 
-// runCmd and runCmdStdin kept for non-wipe use (detection, mount, eject)
+// runCmd kept for non-wipe use (detection, mount, eject)
 func runCmd(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
 
-func runCmdStdin(name string, stdin string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
-	cmd.Stdin = strings.NewReader(stdin)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
-}
-
 // ── Main ─────────────────────────────────────────────────────────────────────
+
+func cleanupStaleMounts() {
+	// Clean up mounts left by prior crashed sessions.
+	// Only match mount points under the system temp dir with the "usbwipe-" prefix
+	// created by os.MkdirTemp("", "usbwipe-").
+	tmpPrefix := os.TempDir() + "/usbwipe-"
+	mounts := parseProcMounts()
+	for dev, mps := range mounts {
+		if !strings.HasPrefix(dev, "/dev/") {
+			continue
+		}
+		for _, mp := range mps {
+			if strings.HasPrefix(mp, tmpPrefix) {
+				logv("cleaning up stale mount: %s on %s", dev, mp)
+				exec.Command("umount", mp).Run()
+				os.Remove(mp)
+			}
+		}
+	}
+	// Also clean up any leftover unmounted temp dirs
+	entries, _ := filepath.Glob(os.TempDir() + "/usbwipe-*")
+	for _, e := range entries {
+		os.Remove(e) // only succeeds if empty (already unmounted)
+	}
+}
 
 func main() {
 	flag.BoolVar(&verbose, "v", false, "verbose diagnostic output")
@@ -1641,6 +1768,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error: must be run as root")
 		os.Exit(1)
 	}
+
+	// Clean up stale browse mounts from prior crashed sessions
+	cleanupStaleMounts()
 
 	devices, err := detectUSBDevices()
 	if err != nil {

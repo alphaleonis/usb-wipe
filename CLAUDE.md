@@ -9,9 +9,8 @@ usbwipe — Terminal UI for wiping USB drives on Linux. Single-file Go program u
 
 ## Branches
 
-- `bubbletea-tui` — current, active development (Bubble Tea TUI)
+- `main` — active development (Bubble Tea TUI)
 - `huh-wizard` — previous version using huh (linear wizard flow), preserved for reference
-- `main` — empty initial commit
 
 ## Architecture
 
@@ -29,21 +28,21 @@ Async operations use `tea.Cmd` functions that return typed messages (e.g. `wipeC
 ## Key patterns
 
 - **Value receivers everywhere** except `buildPartTable`, `startBrowse`, and `cleanupBrowse` (pointer receivers because they mutate model fields used by the returned `tea.Cmd`).
-- **File browser mount/unmount**: if a partition is already mounted, browse in place (`browseMntPath = ""`). If not, mount read-only to `/tmp/usbwipe-{name}` and set `browseMntPath` so cleanup knows to unmount.
+- **File browser mount/unmount**: if a partition is already mounted, browse in place (`browseMntPath = ""`). If not, mount read-only to a random temp dir via `os.MkdirTemp` and set `browseMntPath` so cleanup knows to unmount.
 - **Partition table in detail view**: built fresh via `buildPartTable()` each time a device is selected (not reused/mutated).
 
 ## Backend functions
 
-`detectUSBDevices`, `readSysfs`, `humanSize`, `parseProcMounts`, `parseBlkid`, `checkMountSafety`, `doWipe`, `runCmd`, `runCmdStdin` — these are pure logic, no TUI dependency. Detection requires `/sys/block` and checks both `removable` flag and USB bus path via sysfs symlinks.
+`detectUSBDevices`, `readSysfs`, `humanSize`, `parseProcMounts`, `parseBlkid`, `checkMountSafety`, `doWipe`, `runCmd` — these are pure logic, no TUI dependency. Detection requires `/sys/block` and checks both `removable` flag and USB bus path via sysfs symlinks.
 
 ## External tools used by doWipe
 
 - `umount`, `wipefs`, `sfdisk` — always
 - `mkfs.vfat` — FAT32
 - `mkfs.exfat` — exFAT
-- `badblocks -w` — full verify mode (destructive write test)
-- `badblocks -s` — quick verify for exFAT (since mkfs.exfat has no `-c` flag)
-- `mkfs.vfat -c` — quick verify for FAT32
+- `badblocks -w -s -v` — full verify mode (destructive write test)
+- `badblocks -s -v` — quick verify for exFAT (read-only scan, since mkfs.exfat has no `-c` flag)
+- `mkfs.vfat -c` — quick verify for FAT32 (built-in bad block check)
 
 ## Build & test
 

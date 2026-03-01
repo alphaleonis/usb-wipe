@@ -18,7 +18,7 @@ Built with [Bubble Tea](https://github.com/charmbracelet/bubbletea).
 ## Safety
 
 - Only targets devices that are both `removable` and on a USB bus (verified via sysfs)
-- Refuses to wipe anything mounted at `/`, `/boot`, or `/home`
+- Refuses to wipe anything mounted at critical system paths (`/`, `/boot`, `/home`, `/usr`, `/var`, `/etc`, `/srv`, `/opt`, `/tmp`)
 - Requires explicit "yes" confirmation before wiping
 - File browsing mounts partitions read-only
 
