@@ -1505,7 +1505,13 @@ func doWipe(dev USBDevice, label string, mode wipeMode, fstype fsType, ws *wipeS
 		}
 		emit(fmt.Sprintf("Overwriting device with %s...", src))
 		if err := runCmdStream("dd", ws, "if="+src, "of="+dev.Path, "bs=1M", "status=progress"); err != nil {
-			return fmt.Errorf("dd: %w", err)
+			// dd exits non-zero when it hits the end of the block device ("No space left
+			// on device"). This is expected — it means the entire device was overwritten.
+			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+				// expected: dd wrote until the device was full
+			} else {
+				return fmt.Errorf("dd: %w", err)
+			}
 		}
 	}
 
