@@ -8,13 +8,15 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
-
-	"io"
+	"unsafe"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
@@ -71,7 +73,7 @@ var wipeModeLabels = []string{
 
 var wipeModeDescs = []string{
 	"Reformat only (fastest)",
-	"Reformat with bad sector check (mkfs -c)",
+	"Reformat with bad sector check (FAT32 only)",
 	"Full surface scan with badblocks, then reformat (slow)",
 }
 
@@ -161,7 +163,8 @@ type model struct {
 	wipeOutput   []string
 	wipeState    *wipeState
 	wipeViewport viewport.Model
-	wipeErr        error
+	wipeErr      error
+	confirmAbort bool
 
 	// Eject
 	ejectErr error
@@ -193,6 +196,9 @@ var (
 	successStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("10")).
 			Bold(true)
+
+	cmdStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("8"))
 
 	borderFg = lipgloss.NewStyle().Foreground(borderColor)
 )
@@ -933,7 +939,29 @@ func (m model) renderWipeConfirm() string {
 // ── Wiping ───────────────────────────────────────────────────────────────────
 
 func (m model) updateWiping(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Abort confirmation overlay
+	if m.confirmAbort {
+		if msg, ok := msg.(tea.KeyMsg); ok {
+			switch msg.String() {
+			case "y", "Y":
+				if m.wipeState != nil {
+					m.wipeState.Kill()
+				}
+				return m, tea.Quit
+			case "n", "N", "esc":
+				m.confirmAbort = false
+				return m, nil
+			}
+		}
+		// While overlay is shown, still process spinner and output
+	}
+
 	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		if msg.String() == "ctrl+c" {
+			m.confirmAbort = true
+			return m, nil
+		}
 	case wipeOutputMsg:
 		line := msg.line
 		// Lines prefixed with \r overwrite the last output line (progress counters)
@@ -947,11 +975,12 @@ func (m model) updateWiping(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.wipeOutput = append(m.wipeOutput, line)
 		}
-		m.wipeViewport.SetContent(strings.Join(m.wipeOutput, "\n"))
+		m.wipeViewport.SetContent(renderWipeOutput(m.wipeOutput))
 		m.wipeViewport.GotoBottom()
 		return m, waitForWipeOutput(m.wipeState)
 	case wipeResultMsg:
 		m.wipeErr = msg.err
+		m.confirmAbort = false
 		m.view = viewWipeDone
 		return m, nil
 	case spinner.TickMsg:
@@ -968,6 +997,18 @@ func (m model) updateWiping(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func renderWipeOutput(lines []string) string {
+	styled := make([]string, len(lines))
+	for i, line := range lines {
+		if strings.HasPrefix(line, "\x00") {
+			styled[i] = cmdStyle.Render(line[1:])
+		} else {
+			styled[i] = line
+		}
+	}
+	return strings.Join(styled, "\n")
+}
+
 func (m model) renderWiping() string {
 	dev := m.devices[m.selectedDev]
 	step := "Wiping"
@@ -980,7 +1021,11 @@ func (m model) renderWiping() string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("%s %s %s...\n\n", m.spinner.View(), step, dev.Path))
 	b.WriteString(m.wipeViewport.View())
-	return m.renderPane("Wiping", b.String(), "Please wait...")
+
+	if m.confirmAbort {
+		return m.renderPane("Wiping", b.String(), errStyle.Render("Abort wipe? May leave drive unusable.")+" y abort • n continue")
+	}
+	return m.renderPane("Wiping", b.String(), "ctrl+c abort")
 }
 
 // ── Wipe Done ────────────────────────────────────────────────────────────────
@@ -1088,12 +1133,23 @@ func readDirCmd(path string) tea.Cmd {
 type wipeState struct {
 	ch  chan wipeOutputMsg
 	err error
+	mu  sync.Mutex
+	cmd *exec.Cmd // currently running subprocess
+}
+
+func (ws *wipeState) Kill() {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if ws.cmd != nil && ws.cmd.Process != nil {
+		// Send SIGTERM to the process group
+		syscall.Kill(-ws.cmd.Process.Pid, syscall.SIGTERM)
+	}
 }
 
 func startWipe(dev USBDevice, label string, mode wipeMode, fs fsType) *wipeState {
 	ws := &wipeState{ch: make(chan wipeOutputMsg, 64)}
 	go func() {
-		ws.err = doWipe(dev, label, mode, fs, ws.ch)
+		ws.err = doWipe(dev, label, mode, fs, ws)
 		close(ws.ch)
 	}()
 	return ws
@@ -1317,7 +1373,8 @@ func checkMountSafety(dev USBDevice) error {
 	return nil
 }
 
-func doWipe(dev USBDevice, label string, mode wipeMode, fstype fsType, ch chan<- wipeOutputMsg) error {
+func doWipe(dev USBDevice, label string, mode wipeMode, fstype fsType, ws *wipeState) error {
+	ch := ws.ch
 	emit := func(format string, args ...any) {
 		ch <- wipeOutputMsg{line: fmt.Sprintf(format, args...)}
 	}
@@ -1325,14 +1382,14 @@ func doWipe(dev USBDevice, label string, mode wipeMode, fstype fsType, ch chan<-
 	// Unmount everything
 	if dev.MountPoint != "" {
 		emit("Unmounting %s...", dev.Path)
-		if err := runCmdStream("umount", ch, dev.Path); err != nil {
+		if err := runCmdStream("umount", ws, dev.Path); err != nil {
 			return fmt.Errorf("umount %s: %w", dev.Path, err)
 		}
 	}
 	for _, p := range dev.Partitions {
 		if p.MountPoint != "" {
 			emit("Unmounting %s...", p.Path)
-			if err := runCmdStream("umount", ch, p.Path); err != nil {
+			if err := runCmdStream("umount", ws, p.Path); err != nil {
 				return fmt.Errorf("umount %s: %w", p.Path, err)
 			}
 		}
@@ -1341,14 +1398,14 @@ func doWipe(dev USBDevice, label string, mode wipeMode, fstype fsType, ch chan<-
 	// Full verify: run badblocks destructive write test on whole device
 	if mode == wipeFullVerify {
 		emit("Running full surface scan (badblocks -w)...")
-		if err := runCmdStream("badblocks", ch, "-w", "-s", dev.Path); err != nil {
+		if err := runCmdStream("badblocks", ws, "-w", "-s", "-v", dev.Path); err != nil {
 			return fmt.Errorf("badblocks: %w", err)
 		}
 	}
 
 	// Wipe filesystem signatures
 	emit("Wiping filesystem signatures...")
-	if err := runCmdStream("wipefs", ch, "-a", dev.Path); err != nil {
+	if err := runCmdStream("wipefs", ws, "-a", dev.Path); err != nil {
 		return fmt.Errorf("wipefs: %w", err)
 	}
 
@@ -1361,15 +1418,15 @@ func doWipe(dev USBDevice, label string, mode wipeMode, fstype fsType, ch chan<-
 	default:
 		sfdiskInput = "label: dos\ntype=c\n" // type c = FAT32 LBA
 	}
-	if err := runCmdStdinStream("sfdisk", sfdiskInput, ch, "--lock", dev.Path); err != nil {
+	if err := runCmdStdinStream("sfdisk", sfdiskInput, ws, "--lock", dev.Path); err != nil {
 		return fmt.Errorf("sfdisk: %w", err)
 	}
 
 	// Wait for kernel to pick up new partition table
 	part1 := dev.Path + "1"
 	emit("Waiting for %s to appear...", part1)
-	runCmdStream("partprobe", ch, dev.Path)
-	runCmdStream("udevadm", ch, "settle", "--timeout=5")
+	runCmdStream("partprobe", ws, dev.Path)
+	runCmdStream("udevadm", ws, "settle", "--timeout=5")
 	// Verify the partition device exists
 	for i := 0; i < 20; i++ {
 		if _, err := os.Stat(part1); err == nil {
@@ -1382,27 +1439,21 @@ func doWipe(dev USBDevice, label string, mode wipeMode, fstype fsType, ch chan<-
 	}
 	switch fstype {
 	case fsExFAT:
-		if mode == wipeQuickVerify {
-			emit("Running quick verify (badblocks)...")
-			if err := runCmdStream("badblocks", ch, "-s", part1); err != nil {
-				return fmt.Errorf("badblocks (quick check): %w", err)
-			}
-		}
 		emit("Formatting %s as exFAT (label: %s)...", part1, label)
-		if err := runCmdStream("mkfs.exfat", ch, "-n", label, part1); err != nil {
+		if err := runCmdStream("mkfs.exfat", ws, "-n", label, part1); err != nil {
 			return fmt.Errorf("mkfs.exfat: %w", err)
 		}
 	default:
-		args := []string{"-F", "32", "-n", label}
 		if mode == wipeQuickVerify {
 			emit("Formatting %s as FAT32 with bad block check (label: %s)...", part1, label)
-			args = append(args, "-c")
+			if err := runCmdStream("mkfs.vfat", ws, "-F", "32", "-n", label, "-c", part1); err != nil {
+				return fmt.Errorf("mkfs.vfat: %w", err)
+			}
 		} else {
 			emit("Formatting %s as FAT32 (label: %s)...", part1, label)
-		}
-		args = append(args, part1)
-		if err := runCmdStream("mkfs.vfat", ch, args...); err != nil {
-			return fmt.Errorf("mkfs.vfat: %w", err)
+			if err := runCmdStream("mkfs.vfat", ws, "-F", "32", "-n", label, part1); err != nil {
+				return fmt.Errorf("mkfs.vfat: %w", err)
+			}
 		}
 	}
 
@@ -1410,65 +1461,159 @@ func doWipe(dev USBDevice, label string, mode wipeMode, fstype fsType, ch chan<-
 	return nil
 }
 
-func runCmdStream(name string, ch chan<- wipeOutputMsg, args ...string) error {
-	return runCmdStdinStream(name, "", ch, args...)
+// openPTY allocates a pseudo-terminal pair. The slave side is passed to child
+// processes so they see a real terminal (enabling progress output in tools like
+// badblocks that use \b-based progress bars). The master side is used to read
+// the child's output.
+func openPTY() (master, slave *os.File, err error) {
+	master, err = os.OpenFile("/dev/ptmx", os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		return
+	}
+
+	// Get slave PTY number
+	var n uint32
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, master.Fd(),
+		syscall.TIOCGPTN, uintptr(unsafe.Pointer(&n))); errno != 0 {
+		master.Close()
+		err = fmt.Errorf("TIOCGPTN: %v", errno)
+		return
+	}
+
+	// Unlock slave
+	var unlock int32
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, master.Fd(),
+		syscall.TIOCSPTLCK, uintptr(unsafe.Pointer(&unlock))); errno != 0 {
+		master.Close()
+		err = fmt.Errorf("TIOCSPTLCK: %v", errno)
+		return
+	}
+
+	slave, err = os.OpenFile(fmt.Sprintf("/dev/pts/%d", n), os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		master.Close()
+		return
+	}
+
+	// Set raw mode: disable echo, canonical mode, signal generation,
+	// and output processing (ONLCR converts \n→\r\n which we don't want).
+	var attr syscall.Termios
+	syscall.Syscall(syscall.SYS_IOCTL, slave.Fd(),
+		syscall.TCGETS, uintptr(unsafe.Pointer(&attr)))
+	attr.Iflag &^= syscall.ICRNL | syscall.INLCR | syscall.IGNCR | syscall.IXON
+	attr.Oflag &^= syscall.OPOST
+	attr.Lflag &^= syscall.ECHO | syscall.ECHONL | syscall.ICANON | syscall.ISIG | syscall.IEXTEN
+	syscall.Syscall(syscall.SYS_IOCTL, slave.Fd(),
+		syscall.TCSETS, uintptr(unsafe.Pointer(&attr)))
+
+	return
 }
 
-func runCmdStdinStream(name string, stdin string, ch chan<- wipeOutputMsg, args ...string) error {
+func runCmdStream(name string, ws *wipeState, args ...string) error {
+	return runCmdStdinStream(name, "", ws, args...)
+}
+
+func runCmdStdinStream(name string, stdin string, ws *wipeState, args ...string) error {
 	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
 
-	// Merge stdout and stderr into one pipe
-	pr, pw := io.Pipe()
-	cmd.Stdout = pw
-	cmd.Stderr = pw
+	// Log the command to the wipe output pane
+	ws.ch <- wipeOutputMsg{line: "\x00$ " + name + " " + strings.Join(args, " ")}
+
+	// Use a PTY so child processes see a terminal and flush progress output
+	// immediately (badblocks checks isatty / uses line-buffered stderr on ttys).
+	master, slave, err := openPTY()
+	if err != nil {
+		return fmt.Errorf("openpty: %w", err)
+	}
+	cmd.Stdout = slave
+	cmd.Stderr = slave
 
 	if err := cmd.Start(); err != nil {
+		master.Close()
+		slave.Close()
 		return err
 	}
+	slave.Close() // close slave in parent; child has its own fd
 
-	// Read output, splitting on both \n and \r for progress counters
+	// Register the running command so it can be killed
+	ws.mu.Lock()
+	ws.cmd = cmd
+	ws.mu.Unlock()
+
+	ch := ws.ch
+
+	// Process output byte-by-byte, handling \n, \r, and \b (backspace).
+	// badblocks uses \b to overwrite progress in-place rather than \r.
 	go func() {
-		defer pr.Close()
+		defer master.Close()
 		buf := make([]byte, 4096)
-		var partial string
+		var curLine []byte     // current line buffer (content persists across \b)
+		var cursor int         // write position within curLine
+		var lastEmitted string // last progress string sent to channel
+
+		emit := func(overwrite bool) {
+			s := strings.TrimRight(string(curLine), " ")
+			if s == "" {
+				return
+			}
+			if overwrite {
+				ch <- wipeOutputMsg{line: "\r" + s}
+			} else {
+				ch <- wipeOutputMsg{line: s}
+			}
+			lastEmitted = s
+		}
+
 		for {
-			n, err := pr.Read(buf)
+			n, err := master.Read(buf)
 			if n > 0 {
-				partial += string(buf[:n])
-				// Split on newlines and carriage returns
-				for {
-					idx := strings.IndexAny(partial, "\n\r")
-					if idx < 0 {
-						break
+				for _, b := range buf[:n] {
+					switch b {
+					case '\n':
+						emit(lastEmitted != "")
+						curLine = curLine[:0]
+						cursor = 0
+						lastEmitted = ""
+					case '\r':
+						cursor = 0
+					case '\b':
+						if cursor > 0 {
+							cursor--
+						}
+					default:
+						if cursor < len(curLine) {
+							curLine[cursor] = b // overwrite at cursor
+						} else {
+							curLine = append(curLine, b)
+						}
+						cursor++
 					}
-					line := partial[:idx]
-					sep := partial[idx]
-					partial = partial[idx+1:]
-					if line == "" && sep == '\n' {
-						continue
-					}
-					if sep == '\r' {
-						// Send with \r prefix so the TUI knows to overwrite
-						ch <- wipeOutputMsg{line: "\r" + line}
-					} else {
-						ch <- wipeOutputMsg{line: line}
-					}
+				}
+				// Flush in-progress line so progress is visible immediately
+				s := strings.TrimRight(string(curLine), " ")
+				if s != "" && s != lastEmitted {
+					emit(lastEmitted != "")
 				}
 			}
 			if err != nil {
 				break
 			}
 		}
-		if partial != "" {
-			ch <- wipeOutputMsg{line: partial}
+		s := strings.TrimRight(string(curLine), " ")
+		if s != "" && s != lastEmitted {
+			ch <- wipeOutputMsg{line: s}
 		}
 	}()
 
-	err := cmd.Wait()
-	pw.Close()
+	err = cmd.Wait()
+
+	ws.mu.Lock()
+	ws.cmd = nil
+	ws.mu.Unlock()
 	return err
 }
 
@@ -1506,6 +1651,9 @@ func main() {
 		fmt.Println("No removable USB drives found.")
 		os.Exit(0)
 	}
+
+	// Ignore SIGINT so ctrl+c is handled by the TUI, not the OS signal handler
+	signal.Ignore(syscall.SIGINT)
 
 	m := newModel(devices)
 	p := tea.NewProgram(m, tea.WithAltScreen())
