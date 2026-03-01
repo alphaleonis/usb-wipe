@@ -65,18 +65,24 @@ const (
 	wipeFast wipeMode = iota
 	wipeQuickVerify
 	wipeFullVerify
+	wipeSecureZero
+	wipeSecureRandom
 )
 
 var wipeModeLabels = []string{
 	"Wipe",
 	"Wipe + Quick Verify",
 	"Wipe + Full Verify",
+	"Secure Wipe (Zero)",
+	"Secure Wipe (Random)",
 }
 
 var wipeModeDescs = []string{
 	"Reformat only (fastest)",
 	"Reformat with bad sector check",
 	"Full surface scan with badblocks, then reformat (slow)",
+	"Overwrite entire device with zeros, then reformat",
+	"Overwrite entire device with random data, then reformat",
 }
 
 type fsType int
@@ -1051,6 +1057,10 @@ func (m model) renderWiping() string {
 		step = "Wiping (quick verify)"
 	case wipeFullVerify:
 		step = "Wiping (full verify)"
+	case wipeSecureZero:
+		step = "Secure wiping (zero)"
+	case wipeSecureRandom:
+		step = "Secure wiping (random)"
 	}
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("%s %s %s...\n\n", m.spinner.View(), step, dev.Path))
@@ -1484,6 +1494,18 @@ func doWipe(dev USBDevice, label string, mode wipeMode, fstype fsType, ws *wipeS
 		emit("Running full surface scan (badblocks -w)...")
 		if err := runCmdStream("badblocks", ws, "-w", "-s", "-v", dev.Path); err != nil {
 			return fmt.Errorf("badblocks: %w", err)
+		}
+	}
+
+	// Secure wipe: overwrite entire device with dd
+	if mode == wipeSecureZero || mode == wipeSecureRandom {
+		src := "/dev/zero"
+		if mode == wipeSecureRandom {
+			src = "/dev/urandom"
+		}
+		emit(fmt.Sprintf("Overwriting device with %s...", src))
+		if err := runCmdStream("dd", ws, "if="+src, "of="+dev.Path, "bs=1M", "status=progress"); err != nil {
+			return fmt.Errorf("dd: %w", err)
 		}
 	}
 
