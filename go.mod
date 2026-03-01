@@ -1,4 +1,4 @@
-module github.com/decaf/usbwipe
+module github.com/alphaleonis/usb-wipe
 
 go 1.25.7
 

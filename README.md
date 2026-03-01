@@ -33,6 +33,13 @@ Built with [Bubble Tea](https://github.com/charmbracelet/bubbletea).
 ## Install
 
 ```
+go install github.com/alphaleonis/usb-wipe@latest
+sudo cp "$(go env GOPATH)/bin/usb-wipe" /usr/local/bin/usbwipe
+```
+
+Or build from source:
+
+```
 go build -o usbwipe .
 sudo cp usbwipe /usr/local/bin/
 ```
